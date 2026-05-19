@@ -1,0 +1,34 @@
+# 提取的试卷内容
+exam_pages/
+
+# 课程文件与临时文件
+*.pdf
+2
+parsed_output.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 环境变量（包含凭证）
+.env
