@@ -53,7 +53,7 @@ def parse_metadata_from_text(text):
         year = f"{y1}-{y2}"
 
     if re.search(r'RESIT|RE[- ]?SIT|补考|SUPPLEMENTARY', text, re.IGNORECASE):
-        exam_type = "T"
+        exam_type = "R"
     elif re.search(r'FINAL', text, re.IGNORECASE):
         exam_type = "F"
 
@@ -362,7 +362,7 @@ def capture_canvas(scale=2.0, course_code=None):
         code, year, exam_type = parse_exam_metadata(pdf_viewer)
         folder_name = f"{code}_{year}_{exam_type}"
         output_dir = os.path.join("exam_pages", folder_name)
-        print(f"  课程: {code}  学年: {year}  类型: {'补考' if exam_type == 'T' else '期末'}")
+        print(f"  课程: {code}  学年: {year}  类型: {'补考' if exam_type == 'R' else '期末'}")
         print(f"  输出目录: {output_dir}/")
 
         # 提取

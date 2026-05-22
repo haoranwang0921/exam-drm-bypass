@@ -223,7 +223,7 @@ def extract_one_paper(context, exam_tab, paper: PaperLink,
             output_dir=output_dir, page_count=n, success=True,
         )
 
-    print(f"  {code}  {year}  {'补考' if exam_type == 'T' else '期末'} → {output_dir}/")
+    print(f"  {code}  {year}  {'补考' if exam_type == 'R' else '期末'} → {output_dir}/")
 
     # 5. Canvas 提取
     try:
