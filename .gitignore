@@ -32,3 +32,10 @@ Thumbs.db
 
 # 环境变量（包含凭证）
 .env
+
+# 旧版本生成的本地浏览器资料
+browser_profile/
+browser_profile_from_chrome/
+
+# 专用浏览器 profile（含指纹与登录态）
+chrome_profile*/

@@ -71,9 +71,15 @@ DevTools Network 面板记录初始 PDF 请求，直接 Save as。前提：DevTo
 ### 环境
 
 ```bash
-pip install playwright Pillow
-playwright install chromium
+pip install playwright Pillow python-dotenv
+
+# 配置凭证
+cp .env.example .env
+# 编辑 .env 填入你的用户名和密码
 ```
+
+请先安装 Google Chrome。每次运行都会由系统 Chrome 创建一个临时浏览器用户，
+Playwright 通过本地调试接口连接；程序退出后临时用户资料会被删除。
 
 ### 批量提取
 
@@ -87,7 +93,7 @@ python batch_capture.py
 
 # 可选参数
 python batch_capture.py EEE112 --scale 1.5   # 低分辨率提速
-python batch_capture.py EEE112 --headless     # 无头模式
+python batch_capture.py EEE112 --headless     # 无头模式（无法手动登录）
 ```
 
 ### 单篇提取

@@ -9,6 +9,10 @@ import re
 import os
 import sys
 import base64
+import time
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # 修复 Windows GBK 终端编码问题
 if sys.platform == 'win32':
@@ -18,11 +22,16 @@ if sys.platform == 'win32':
         pass
 
 from playwright.sync_api import sync_playwright
+from browser_session import fresh_chrome_context
 
 VIEWPORT = {"width": 2560, "height": 1440}
 BASE_URL = "https://etd.xjtlu.edu.cn/index.html#/index"
-
-
+# 专用 profile：一次性完整复制日常 Chrome 的指纹数据（WAF/UEBA 指纹存于
+# localStorage + IndexedDB）。UEBA 行为风控会拒绝无指纹的全新浏览器
+# （ueba/send 400），且能识别模拟鼠标轨迹，登录必须由真人手动完成一次。
+# 登录成功后在本进程内继续提取（不要重启浏览器），会话才会延续。
+# 注意：风控分数在连续失败后会累积升高，失败后需等待 1-2 小时冷却再试。
+SPECIAL_PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_profile_v3")
 # ═══════════════════════════════════════════════════════════════
 # 元数据解析
 # ═══════════════════════════════════════════════════════════════
@@ -64,45 +73,52 @@ def parse_metadata_from_text(text):
 # 可复用流程函数
 # ═══════════════════════════════════════════════════════════════
 
-def login(page, username=None, password=None):
-    """登录 XJTLU 考试系统。凭证优先从参数读取，否则从环境变量 XJTLU_USERNAME / XJTLU_PASSWORD 读取。"""
-    if not username:
-        username = os.environ.get("XJTLU_USERNAME", "")
-    if not password:
-        password = os.environ.get("XJTLU_PASSWORD", "")
-    if not username or not password:
-        raise RuntimeError(
-            "未设置登录凭证。请设置环境变量 XJTLU_USERNAME 和 XJTLU_PASSWORD，"
-            "或通过 login(page, username, password) 传入。"
-        )
+def login(page, username=None, password=None, allow_manual=True):
+    """打开考试系统，复用会话或等待用户手动登录（不自动提交凭证）。
+
+    XJTLU SSO 带深信服 UEBA 风控（鼠标轨迹指纹），自动点击的零轨迹行为
+    会被风控 400 拦截，因此登录一律由用户手动完成。
+    """
     print("打开首页...")
-    page.goto(BASE_URL)
-    page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(500)
+    page.goto(BASE_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(1500)
 
+    if page.get_by_text("Past Exam Papers", exact=True).count():
+        print("已复用浏览器登录状态。")
+        return
+
+    # 跳转链：etd → 307 → trust.xjtlu.edu.cn (深信服 SDP) → sso → uim 登录页
+    print("等待 SSO 跳转到登录页...")
     try:
-        print("查找登录表单...")
-        page.wait_for_selector("input[type='password']", timeout=5000)
-        page.fill("input[type='password']", password)
+        page.wait_for_selector("input[type='password']", timeout=20000)
+        print("已到达登录页，请在浏览器窗口中手动完成登录。")
+    except Exception:
+        print(f"警告：20 秒内未出现登录表单，当前 url: {page.url[:120]}")
+        try:
+            page.screenshot(path="debug_login_timeout.png")
+            print("已保存 debug_login_timeout.png")
+        except Exception:
+            pass
 
-        inputs = page.query_selector_all("input")
-        for inp in inputs:
-            if inp.get_attribute("type") == "text":
-                inp.fill(username)
-                break
+    if not allow_manual:
+        raise RuntimeError(
+            "浏览器登录状态已失效。请先去掉 --headless 运行一次并手动登录。"
+        )
 
-        print("点击 Sign in 按钮...")
-        page.click("button:has-text('Sign in')")
-        page.wait_for_timeout(500)
+    print("程序将等待登录完成（最多 5 分钟）...")
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        try:
+            if page.get_by_text("Past Exam Papers", exact=True).count():
+                print("登录成功，继续流程。")
+                return
+            page.wait_for_timeout(1000)
+        except Exception as e:
+            print(f"等待登录时浏览器异常：{type(e).__name__}: {str(e)[:120]}")
+            print("提示：登录窗口被关闭或 Chrome 崩溃，请重新运行脚本。")
+            raise RuntimeError("登录窗口已关闭") from e
 
-        print("点击 Login 按钮...")
-        page.click("button:has-text('Login'), button:has-text('Log in'), button[type='submit']")
-        print("已提交登录，等待跳转...")
-        page.wait_for_timeout(1000)
-    except Exception as e:
-        print(f"登录过程: {e}")
-
-    page.wait_for_timeout(1000)
+    raise RuntimeError("等待手动登录超时，请重新运行程序。")
 
 
 def navigate_to_past_exam_papers(page):
@@ -119,7 +135,7 @@ def navigate_to_past_exam_papers(page):
         exam_tab = page
 
     exam_tab.set_viewport_size(VIEWPORT)
-    exam_tab.wait_for_load_state("networkidle")
+    exam_tab.wait_for_load_state("domcontentloaded")
     exam_tab.wait_for_timeout(1000)
     return exam_tab
 
@@ -329,49 +345,48 @@ def capture_canvas(scale=2.0, course_code=None):
         raise RuntimeError("未指定课程代码，请设置环境变量 XJTLU_COURSE 或传入 course_code 参数。")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        page = browser.new_page()
-        page.set_viewport_size(VIEWPORT)
+        with fresh_chrome_context(p, headless=False, user_data_dir=SPECIAL_PROFILE) as context:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.set_viewport_size(VIEWPORT)
 
-        login(page)
-        exam_tab = navigate_to_past_exam_papers(page)
-        agree_and_search(exam_tab, course_code)
+            login(page)
+            exam_tab = navigate_to_past_exam_papers(page)
+            agree_and_search(exam_tab, course_code)
 
-        # 点击第一篇试卷
-        print("点击第一个试卷...")
-        exam_tab.click("a[href*='PaperDetail']")
-        exam_tab.wait_for_timeout(1000)
+            # 点击第一篇试卷
+            print("点击第一个试卷...")
+            exam_tab.click("a[href*='PaperDetail']")
+            exam_tab.wait_for_timeout(1000)
 
-        print("点击 View Online 按钮...")
-        exam_tab.click("text=View Online")
-        exam_tab.wait_for_timeout(3000)
+            print("点击 View Online 按钮...")
+            exam_tab.click("text=View Online")
+            exam_tab.wait_for_timeout(3000)
 
-        # 切换到 PDF viewer 标签页
-        context = browser.contexts[0]
-        if len(context.pages) > 1:
-            pdf_viewer = context.pages[-1]
-            print(f"已切换到 PDF viewer 标签页: {pdf_viewer.url}")
-        else:
-            pdf_viewer = exam_tab
+            # 切换到 PDF viewer 标签页
+            if len(context.pages) > 1:
+                pdf_viewer = context.pages[-1]
+                print(f"已切换到 PDF viewer 标签页: {pdf_viewer.url}")
+            else:
+                pdf_viewer = exam_tab
 
-        pdf_viewer.set_viewport_size(VIEWPORT)
-        pdf_viewer.wait_for_timeout(3000)
+            pdf_viewer.set_viewport_size(VIEWPORT)
+            pdf_viewer.wait_for_timeout(3000)
 
-        # 元数据 & 输出目录
-        print("解析试卷元数据...")
-        code, year, exam_type = parse_exam_metadata(pdf_viewer)
-        folder_name = f"{code}_{year}_{exam_type}"
-        output_dir = os.path.join("exam_pages", folder_name)
-        print(f"  课程: {code}  学年: {year}  类型: {'补考' if exam_type == 'R' else '期末'}")
-        print(f"  输出目录: {output_dir}/")
+            # 元数据 & 输出目录
+            print("解析试卷元数据...")
+            code, year, exam_type = parse_exam_metadata(pdf_viewer)
+            folder_name = f"{code}_{year}_{exam_type}"
+            output_dir = os.path.join("exam_pages", folder_name)
+            print(f"  课程: {code}  学年: {year}  类型: {'补考' if exam_type == 'R' else '期末'}")
+            print(f"  输出目录: {output_dir}/")
 
-        # 提取
-        page_count = extract_canvas_pages(pdf_viewer, output_dir, scale)
+            # 提取
+            page_count = extract_canvas_pages(pdf_viewer, output_dir, scale)
 
-        if page_count > 1:
-            print("提示: 运行 python merge_png_to_pdf.py 可将 PNG 合并为单个 PDF")
+            if page_count > 1:
+                print("提示: 运行 python merge_png_to_pdf.py 可将 PNG 合并为单个 PDF")
 
-        print("完成")
+            print("完成")
 
 
 if __name__ == "__main__":
