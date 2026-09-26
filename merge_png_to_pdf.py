@@ -30,20 +30,36 @@ def merge_png_to_pdf(input_dir=None, output_file=None):
 
     if not files:
         print(f"未在 {input_dir}/ 下找到 pdf_page_*.png 文件")
-        return
-
-    images = []
-    for f in files:
-        img = Image.open(f).convert("RGB")
-        images.append(img)
-        print(f"  {os.path.basename(f)} ({img.width}×{img.height})")
+        return None
 
     if output_file is None:
         folder_name = os.path.basename(input_dir.rstrip("/\\"))
         output_file = os.path.join(input_dir, f"{folder_name}.pdf")
 
-    images[0].save(output_file, save_all=True, append_images=images[1:])
+    images = []
+    try:
+        for f in files:
+            with Image.open(f) as source:
+                img = source.convert("RGB")
+            images.append(img)
+            print(f"  {os.path.basename(f)} ({img.width}×{img.height})")
+
+        images[0].save(output_file, save_all=True, append_images=images[1:])
+    finally:
+        for image in images:
+            image.close()
+
     print(f"\n已合并 → {output_file}（共 {len(images)} 页）")
+    return output_file
+
+
+def merge_missing_pdf(input_dir):
+    """为已有的 PNG 页面目录生成同名 PDF；已有 PDF 时保持不变。"""
+    folder_name = os.path.basename(os.path.normpath(input_dir))
+    output_file = os.path.join(input_dir, f"{folder_name}.pdf")
+    if os.path.isfile(output_file):
+        return output_file
+    return merge_png_to_pdf(input_dir=input_dir, output_file=output_file)
 
 
 if __name__ == "__main__":

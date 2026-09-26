@@ -6,6 +6,8 @@
 
 ```
 exam-drm-bypass/
+├── login.py               # 第一步：手动登录，Chrome 常驻（--status/--close）
+├── browser_session.py     # Chrome 启动/CDP 连接、常驻会话状态与进程树管理
 ├── capture_canvas.py      # 核心库：可复用函数 + 单篇提取入口
 ├── batch_capture.py       # 批量提取主脚本（支持交互询问）
 ├── merge_png_to_pdf.py    # PNG 合成 PDF 工具
@@ -71,17 +73,34 @@ DevTools Network 面板记录初始 PDF 请求，直接 Save as。前提：DevTo
 ### 环境
 
 ```bash
-pip install playwright Pillow python-dotenv
-
-# 配置凭证
-cp .env.example .env
-# 编辑 .env 填入你的用户名和密码
+pip install playwright Pillow python-dotenv rapidocr onnxruntime
 ```
 
-请先安装 Google Chrome。每次运行都会由系统 Chrome 创建一个临时浏览器用户，
-Playwright 通过本地调试接口连接；程序退出后临时用户资料会被删除。
+请先安装 Google Chrome。脚本启动的 Chrome 会绕过系统代理直连学校网站。登录由真人在浏览器中手动完成，无需在 .env 中配置密码。
+
+### 推荐：两步法（登录与抓取分离）
+
+SSO 带深信服 UEBA 风控（鼠标轨迹指纹），自动登录会被拦截；且会话 Cookie 是会话级的，Chrome 关闭后无法靠 profile 恢复。因此先启动一个常驻 Chrome 完成手动登录，抓取脚本通过 CDP 复用它：
+
+```bash
+# 第一步：启动常驻 Chrome，在弹出的窗口中手动登录
+python login.py
+# 登录成功后脚本退出，Chrome 保持运行
+
+# 第二步：运行抓取（可连续抓多门课，无需重复登录）
+python batch_capture.py EEE112
+python batch_capture.py MTH102
+
+# 查看常驻浏览器状态 / 用完关闭
+python login.py --status
+python login.py --close
+```
+
+注意：常驻 Chrome 运行期间，不要用同一 profile 再打开另一个 Chrome 窗口；脚本中途失败重跑会自动重连，无需重新登录。若常驻浏览器的登录态过期，重新运行 `python login.py` 即可。
 
 ### 批量提取
+
+批量提取成功后，每套试卷目录会自动生成同名 PDF。若目录中已有页面 PNG 但缺少 PDF，再次运行时会补生成，不会重新覆盖已有 PDF。扫描件没有可提取文字时，程序会用本地 OCR 识别首页的学年和考试类型。
 
 ```bash
 # 命令行传入课程代码
@@ -93,13 +112,14 @@ python batch_capture.py
 
 # 可选参数
 python batch_capture.py EEE112 --scale 1.5   # 低分辨率提速
-python batch_capture.py EEE112 --headless     # 无头模式（无法手动登录）
 ```
+
+未运行 login.py 时，batch_capture.py 会退回到旧模式：自行启动浏览器并等待手动登录，抓取结束后关闭。
 
 ### 单篇提取
 
 ```bash
-python capture_canvas.py        # 默认 2x 缩放，搜索 EEE112
+python capture_canvas.py        # 默认 2x 缩放，交互询问课程代码
 python capture_canvas.py 1.5    # 1.5x 缩放
 ```
 
@@ -114,9 +134,9 @@ python merge_png_to_pdf.py exam_pages/EEE112_2022-23_F
 
 ```
 ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
-│  登录    │ → │ 导航搜索  │ → │ 收集链接  │ → │ 逐篇提取  │
-│ XJTLU   │   │ 课程代码  │   │ 处理分页  │   │ 新标签页  │
-│ Portal   │   │ Search   │   │ href去重  │   │ Canvas   │
+│ login.py │ → │ 导航搜索  │ → │ 收集链接  │ → │ 逐篇提取  │
+│ 手动登录  │   │ 课程代码  │   │ 处理分页  │   │ 新标签页  │
+│ Chrome常驻│   │ Search   │   │ href去重  │   │ Canvas   │
 └──────────┘   └──────────┘   └──────────┘   └──────────┘
                                                   ↓
                                              元数据解析
@@ -139,11 +159,11 @@ python merge_png_to_pdf.py exam_pages/EEE112_2022-23_F
 ### 元数据解析降级链
 
 ```
-主路径: PDF textLayer 文字 → 正则提取 CODE/YEAR/TYPE
-  ↓ 失败
-降级1: 搜索结果文字解析
-  ↓ 失败
-降级2: 课程代码 + 索引编号
+主路径: 网站搜索结果行及详情页 → 提取 CODE/YEAR/TYPE
+  ↓ 字段缺失
+降级1: PDF 首页文字 / OCR 补全缺失字段
+  ↓ 学年仍无法确认
+降级2: 课程代码 + 索引编号（idx）
 ```
 
 ## 产出示例

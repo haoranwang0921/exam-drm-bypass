@@ -21,7 +21,7 @@ if sys.platform == 'win32':
 from dataclasses import dataclass, field
 from typing import Optional
 from playwright.sync_api import sync_playwright
-from browser_session import fresh_chrome_context
+from browser_session import open_chrome
 
 from capture_canvas import (
     VIEWPORT,
@@ -30,12 +30,13 @@ from capture_canvas import (
     navigate_to_past_exam_papers,
     agree_and_search,
     collect_search_results,
-    parse_exam_metadata,
-    parse_metadata_from_text,
+    resolve_paper_metadata,
+    read_detail_text,
     extract_canvas_pages,
     has_next_page,
     go_to_next_page,
 )
+from merge_png_to_pdf import merge_missing_pdf
 
 
 @dataclass
@@ -44,6 +45,7 @@ class PaperLink:
     text: str
     index: int
     page_num: int
+    site_text: str = ""
 
 
 @dataclass
@@ -64,84 +66,112 @@ def batch_capture(course_code: str, scale: float = 2.0, headless: bool = False):
     """批量提取 course_code 下所有试卷"""
 
     with sync_playwright() as p:
-        with fresh_chrome_context(p, headless=headless, user_data_dir=SPECIAL_PROFILE) as context:
+        with open_chrome(p, headless=headless, user_data_dir=SPECIAL_PROFILE) as (context, persistent):
             context.set_default_timeout(30000)
 
             # ═══════════════════ Phase 1: 登录 & 搜索 ═══════════════════
-            index_page = context.pages[0] if context.pages else context.new_page()
+            # attach 到常驻浏览器时新开工作标签，不触碰登录用的原始标签；
+            # 新启动浏览器时复用其初始标签。
+            if persistent:
+                index_page = context.new_page()
+            else:
+                index_page = context.pages[0] if context.pages else context.new_page()
             index_page.set_viewport_size(VIEWPORT)
-            login(index_page, allow_manual=not headless)
 
-            exam_tab = navigate_to_past_exam_papers(index_page)
-            agree_and_search(exam_tab, course_code)
+            exam_tab = None
+            try:
+                # 常驻浏览器有界面，即使会话失效也允许用户当场重新登录
+                login(index_page, allow_manual=persistent or not headless)
 
-            # ═══════════════════ Phase 2: 收集所有论文链接 ═══════════════════
-            all_papers, seen_hrefs = [], set()
-            page_num = 1
+                exam_tab = navigate_to_past_exam_papers(index_page)
+                agree_and_search(exam_tab, course_code)
 
-            while True:
-                # 滚动到底部确保懒加载内容可见
-                exam_tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                exam_tab.wait_for_timeout(500)
-                exam_tab.evaluate("window.scrollTo(0, 0)")
-                exam_tab.wait_for_timeout(500)
+                # ═══════════════════ Phase 2: 收集所有论文链接 ═══════════════════
+                all_papers, seen_hrefs = [], set()
+                page_num = 1
 
-                papers = collect_search_results(exam_tab)
-                new_count = 0
-                for p in papers:
-                    if p["href"] not in seen_hrefs:
-                        seen_hrefs.add(p["href"])
-                        all_papers.append(PaperLink(
-                            href=p["href"],
-                            text=p["text"],
-                            index=p["index"],
-                            page_num=page_num,
-                        ))
-                        new_count += 1
+                while True:
+                    # 滚动到底部确保懒加载内容可见
+                    exam_tab.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    exam_tab.wait_for_timeout(500)
+                    exam_tab.evaluate("window.scrollTo(0, 0)")
+                    exam_tab.wait_for_timeout(500)
 
-                print(f"  搜索页 {page_num}: +{new_count} 篇 (累计 {len(all_papers)})")
+                    papers = collect_search_results(exam_tab)
+                    new_count = 0
+                    for paper in papers:
+                        if paper["href"] not in seen_hrefs:
+                            seen_hrefs.add(paper["href"])
+                            all_papers.append(PaperLink(
+                                href=paper["href"],
+                                text=paper["text"],
+                                index=paper["index"],
+                                page_num=page_num,
+                                site_text=paper.get("site_text", ""),
+                            ))
+                            new_count += 1
 
-                if not has_next_page(exam_tab):
-                    break
-                go_to_next_page(exam_tab)
-                page_num += 1
+                    print(f"  搜索页 {page_num}: +{new_count} 篇 (累计 {len(all_papers)})")
 
-            if not all_papers:
-                print(f"未找到 {course_code} 的试卷。")
-                return
+                    if not has_next_page(exam_tab):
+                        break
+                    go_to_next_page(exam_tab)
+                    page_num += 1
 
-            print(f"\n共发现 {len(all_papers)} 篇试卷，开始提取...\n")
+                if not all_papers:
+                    print(f"未找到 {course_code} 的试卷。")
+                    return
 
-            # ═══════════════════ Phase 3: 逐篇提取 ═══════════════════
-            results: list[ExtractionResult] = []
-            failed: list[tuple[PaperLink, str]] = []
+                print(f"\n共发现 {len(all_papers)} 篇试卷，开始提取...\n")
 
-            for idx, paper in enumerate(all_papers):
-                print(f"{'='*60}")
-                print(f"[{idx+1}/{len(all_papers)}] {paper.text[:100]}")
-                print(f"      href: {paper.href[:120]}...")
+                # ═══════════════════ Phase 3: 逐篇提取 ═══════════════════
+                results: list[ExtractionResult] = []
+                failed: list[tuple[PaperLink, str]] = []
 
-                try:
-                    result = extract_one_paper(context, exam_tab, paper, scale, course_code)
-                    results.append(result)
-                    if result.success:
-                        print(f"  ✓ {result.folder_name} ({result.page_count} 页)")
-                    else:
-                        failed.append((paper, result.error or "unknown"))
-                        print(f"  ✗ {result.error}")
-                except Exception as e:
-                    failed.append((paper, str(e)))
-                    print(f"  ✗ 异常: {e}")
-                    cleanup_extra_tabs(context, keep=[exam_tab, index_page])
+                for idx, paper in enumerate(all_papers):
+                    print(f"{'='*60}")
+                    print(f"[{idx+1}/{len(all_papers)}] {paper.text[:100]}")
+                    print(f"      href: {paper.href[:120]}...")
 
-            # ═══════════════════ Phase 4: 汇总 ═══════════════════
-            print(f"\n{'='*60}")
-            print("批量提取完成")
-            print(f"  共发现: {len(all_papers)} 篇")
-            print(f"  成功: {sum(1 for r in results if r.success)} 篇")
-            print(f"  失败: {len(failed)} 篇")
-            for paper, err in failed:
-                print(f"    - {paper.text[:60]}: {err}")
+                    try:
+                        result = extract_one_paper(context, exam_tab, paper, scale, course_code)
+                        results.append(result)
+                        if result.success:
+                            print(f"  ✓ {result.folder_name} ({result.page_count} 页)")
+                        else:
+                            failed.append((paper, result.error or "unknown"))
+                            print(f"  ✗ {result.error}")
+                    except Exception as e:
+                        failed.append((paper, str(e)))
+                        print(f"  ✗ 异常: {e}")
+                        # 常驻浏览器只清理本次提取的残留标签；
+                        # 一次性浏览器可关闭除工作页外的全部标签
+                        if persistent:
+                            cleanup_extraction_tabs(context, keep=[exam_tab, index_page])
+                        else:
+                            cleanup_extra_tabs(context, keep=[exam_tab, index_page])
+
+                # ═══════════════════ Phase 4: 汇总 ═══════════════════
+                print(f"\n{'='*60}")
+                print("批量提取完成")
+                print(f"  共发现: {len(all_papers)} 篇")
+                print(f"  成功: {sum(1 for r in results if r.success)} 篇")
+                print(f"  失败: {len(failed)} 篇")
+                for paper, err in failed:
+                    print(f"    - {paper.text[:60]}: {err}")
+
+            finally:
+                if persistent:
+                    # 关闭本次抓取创建的标签，常驻浏览器保持运行
+                    close_tabs = []
+                    for tab in (exam_tab, index_page):
+                        if tab is not None and all(tab is not x for x in close_tabs):
+                            close_tabs.append(tab)
+                    for tab in close_tabs:
+                        try:
+                            tab.close()
+                        except Exception:
+                            pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -161,6 +191,7 @@ def extract_one_paper(context, exam_tab, paper: PaperLink,
     detail_page.goto(paper.href)
     detail_page.wait_for_load_state("networkidle")
     detail_page.wait_for_timeout(1000)
+    detail_text = read_detail_text(detail_page)
 
     # 2. 点击 View Online
     try:
@@ -192,21 +223,12 @@ def extract_one_paper(context, exam_tab, paper: PaperLink,
     pdf_viewer.set_viewport_size(VIEWPORT)
     pdf_viewer.wait_for_timeout(3000)
 
-    # 4. 解析元数据（多级降级）
-    code, year, exam_type = parse_exam_metadata(pdf_viewer)
-
-    if code == "UNKNOWN" or year == "unknown":
-        code2, year2, type2 = parse_metadata_from_text(paper.text)
-        if code == "UNKNOWN":
-            code = code2
-        if year == "unknown":
-            year = year2
-        if exam_type == "F" and type2 != "F":
-            exam_type = type2
+    # 4. 优先解析网站信息；PDF 封面只补全缺失字段
+    code, year, exam_type = resolve_paper_metadata(
+        paper.text, paper.site_text, detail_text, pdf_viewer, course_code,
+    )
 
     # 最后兜底
-    if code == "UNKNOWN":
-        code = course_code
     if year == "unknown":
         year = f"idx{paper.page_num:02d}_{paper.index:02d}"
 
@@ -215,8 +237,12 @@ def extract_one_paper(context, exam_tab, paper: PaperLink,
 
     # 去重：已存在则跳过
     if os.path.exists(output_dir) and os.listdir(output_dir):
-        n = len(os.listdir(output_dir))
-        print(f"  ⏭ 已存在 {n} 个文件，跳过")
+        n = sum(
+            1 for name in os.listdir(output_dir)
+            if re.fullmatch(r"pdf_page_\d+\.png", name, re.IGNORECASE)
+        )
+        print(f"  ⏭ 已存在 {n} 张页面图片，跳过重新提取")
+        _ensure_paper_pdf(output_dir)
         pdf_viewer.close()
         detail_page.close()
         return ExtractionResult(
@@ -239,6 +265,9 @@ def extract_one_paper(context, exam_tab, paper: PaperLink,
             error=f"提取异常: {e}",
         )
 
+    if page_count > 0:
+        _ensure_paper_pdf(output_dir)
+
     # 6. 清理标签页
     pdf_viewer.close()
     detail_page.close()
@@ -250,6 +279,18 @@ def extract_one_paper(context, exam_tab, paper: PaperLink,
     )
 
 
+def _ensure_paper_pdf(output_dir: str):
+    """合并已抓取的页面；失败时保留 PNG，不把抓取标记为失败。"""
+    try:
+        pdf_path = merge_missing_pdf(output_dir)
+    except Exception as exc:
+        print(f"  PDF 合并失败，PNG 页面已保留: {type(exc).__name__}: {exc}")
+        return None
+    if pdf_path:
+        print(f"  PDF 已生成: {pdf_path}")
+    return pdf_path
+
+
 # ═══════════════════════════════════════════════════════════════
 # 工具函数
 # ═══════════════════════════════════════════════════════════════
@@ -259,6 +300,27 @@ def cleanup_extra_tabs(context, keep: list):
     kept_ids = {id(p) for p in keep}
     for p in context.pages:
         if id(p) not in kept_ids:
+            try:
+                p.close()
+            except Exception:
+                pass
+
+
+def cleanup_extraction_tabs(context, keep: list):
+    """常驻浏览器下的异常清理：只关闭试卷详情 / PDF viewer 残留标签，
+    不动登录标签和用户自己打开的标签。"""
+    kept_ids = {id(p) for p in keep}
+    for p in list(context.pages):
+        if id(p) in kept_ids:
+            continue
+        try:
+            url = p.url or ""
+        except Exception:
+            url = ""
+        url_lower = url.lower()
+        if ("paperdetail" in url_lower
+                or "/sf-webproxy/" in url_lower
+                or "pdf" in url_lower):
             try:
                 p.close()
             except Exception:
