@@ -1,214 +1,104 @@
-# 在线试卷系统 DRM 绕过与批量提取工具
+# XJTLU Past Exam Papers 批量整理工具
 
-网络攻防实训。针对在线试卷系统的 PDF.js 阅读器，分析其多层前端 DRM 防护机制，设计 Canvas 层提取方案完成绕过，实现批量自动化提取。
+登录学校试卷库后，按课程代码查找试卷，将可在线查看的页面保存为 PNG，并在每套试卷目录中自动合并为 PDF。登录必须由用户在 Chrome 中手动完成；程序不会代填账号密码。
 
-## 项目结构
+仅用于你有权访问和保存的试卷。请遵守学校网站的使用条款，不要公开分享下载内容或浏览器登录资料。
 
-```
-exam-drm-bypass/
-├── login.py               # 第一步：手动登录，Chrome 常驻（--status/--close）
-├── browser_session.py     # Chrome 启动/CDP 连接、常驻会话状态与进程树管理
-├── capture_canvas.py      # 核心库：可复用函数 + 单篇提取入口
-├── batch_capture.py       # 批量提取主脚本（支持交互询问）
-├── merge_png_to_pdf.py    # PNG 合成 PDF 工具
-├── capture.py             # 原始截图方案（已弃用，仅作参考）
-└── exam_pages/            # 产出目录
-    ├── EEE112_2022-23_F/  # 课程代码_学年_类型 (F=期末 R=补考)
-    ├── EEE112_2022-23_R/
-    └── ...
+## 快速开始（Windows）
+
+需要 Python 3.10+、Google Chrome，以及能够访问学校试卷库的网络。以下命令在 PowerShell 中运行。
+
+```powershell
+git clone https://github.com/haoranwang0921/exam-drm-bypass.git
+cd exam-drm-bypass
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install playwright Pillow python-dotenv rapidocr onnxruntime
 ```
 
-## 靶场分析
+如果已经有项目目录和 `.venv`，直接在项目目录运行后面的命令即可，不需要重复克隆或安装。
 
-### 目标系统
+### 1. 手动登录
 
-在线考试试卷查看器，基于 Mozilla PDF.js 构建。URL 经安全代理（/sf-webproxy/）转发，页面含用户 ID 水印。
-
-### 防护层级（共五层）
-
-| 层级 | 技术手段 | 防护意图 | 代码位置 |
-|------|---------|---------|---------|
-| **输入层** | `keydown` 捕获 Ctrl+S/Ctrl+P + `stopImmediatePropagation` | 阻止快捷键保存/打印 | `<head>` 内联脚本 |
-| **输入层** | `contextmenu` 事件 `preventDefault` | 禁用右键菜单 | `<head>` 内联脚本 |
-| **渲染层** | CSS `!important` 隐藏下载/打印按钮 | 阻止 UI 操作入口 | `<style>` 标签 |
-| **渲染层** | `@media print { * { display:none } }` | 打印时全屏遮罩 | `<style>` 标签 |
-| **事件层** | `beforeprint`/`afterprint` 动态隐藏 DOM | 打印前替换内容为警告文字 | `<head>` 内联脚本 |
-| **API层** | 重写 `window.print`、`PDFViewerApplication.download` | 阻止程序化调用 | JS 运行时覆盖 |
-| **网络层** | 劫持 `XMLHttpRequest.prototype` | 拦截 PDF 请求 4xx/5xx，统一弹窗假报错 | `DOMContentLoaded` 内 |
-
-### 防护评估
-
-- **有效**: 对普通用户的心理威慑、防止 Ctrl+P 误操作
-- **无效**: 对所有防护层均存在已知绕过手段，且存在——Canvas 这层**根本性无法防护**，因为内容已被浏览器解码渲染到 `<canvas>` 元素，`canvas.toDataURL()` 是浏览器原生 API，页面 JS 无权也无法阻止。
-
-结论：前端 DRM 属于「安全剧场」（Security Theater），其理论局限在于——内容一旦在终端解密渲染，控制权即转移至用户。
-
-## 攻击路径设计
-
-### 主路径: Canvas 层直接提取（成功率 ~100%）
-
-PDF.js 将每页渲染到 `.page[data-page-number="N"] canvas` 元素。Canvas API 是浏览器原生接口，不受页面 JS 层任何防护代码影响。水印位于 DOM 层（`.textLayer`），Canvas 内为纯净页面图像。
-
-```
-信息收集 → 定位 canvas 元素
-触发渲染 → PDFViewerApplication.page = N
-数据提取 → canvas.toDataURL('image/png')
-持久化   → base64 解码 → PNG → 合并为 PDF
+```powershell
+.\.venv\Scripts\python.exe login.py
 ```
 
-没有任何防护代码触及 Canvas API——该路径从根源上绕过了所有五层防护。
+程序会打开专用 Chrome。请在窗口中手动登录学校网站，等待终端显示“登录完成”。**不要关闭这个 Chrome 窗口**；后续抓取会复用同一登录会话。无需配置 `.env` 中的用户名或密码，脚本不会使用它们自动登录。
 
-### 备用路径: Network 面板取 PDF 二进制（成功率 ~80%）
+### 2. 抓取课程试卷
 
-DevTools Network 面板记录初始 PDF 请求，直接 Save as。前提：DevTools 在页面加载前已打开。
-
-### 不可靠路径
-
-- 恢复 `display:none` 按钮：按钮已被 `cloneNode` 替换，事件监听已丢失
-- 仅解除快捷键拦截：后续还有 DOM + API 层等待
-- 删除 `@media print` 样式：`beforeprint` 事件监听同样会拦截
-
-## 使用方式
-
-### 环境
-
-```bash
-pip install playwright Pillow python-dotenv rapidocr onnxruntime
+```powershell
+.\.venv\Scripts\python.exe batch_capture.py CAN209
 ```
 
-请先安装 Google Chrome。脚本启动的 Chrome 会绕过系统代理直连学校网站。登录由真人在浏览器中手动完成，无需在 .env 中配置密码。
+将 `CAN209` 换成实际课程代码。例如，学校试卷库中 *Advanced Electrical Circuits and Electromagnetics* 对应 `CAN209`，*Continuous and Discrete Time Signals and Systems* 对应 `CAN207`。请以试卷库搜索结果中的完整标题核对课程，不能仅凭相似名称猜代码。
 
-### 推荐：两步法（登录与抓取分离）
+脚本会列出找到、成功和失败的篇数。抓取结束后，PDF 和分页图片位于 `exam_pages/`：
 
-SSO 带深信服 UEBA 风控（鼠标轨迹指纹），自动登录会被拦截；且会话 Cookie 是会话级的，Chrome 关闭后无法靠 profile 恢复。因此先启动一个常驻 Chrome 完成手动登录，抓取脚本通过 CDP 复用它：
-
-```bash
-# 第一步：启动常驻 Chrome，在弹出的窗口中手动登录
-python login.py
-# 登录成功后脚本退出，Chrome 保持运行
-
-# 第二步：运行抓取（可连续抓多门课，无需重复登录）
-python batch_capture.py EEE112
-python batch_capture.py MTH102
-
-# 查看常驻浏览器状态 / 用完关闭
-python login.py --status
-python login.py --close
+```text
+exam_pages/
+  CAN209_2024-25_F/
+    CAN209_2024-25_F.pdf
+    pdf_page_001.png
+    pdf_page_002.png
+    ...
+  CAN209_2024-25_R/
+    CAN209_2024-25_R.pdf
+    ...
 ```
 
-注意：常驻 Chrome 运行期间，不要用同一 profile 再打开另一个 Chrome 窗口；脚本中途失败重跑会自动重连，无需重新登录。若常驻浏览器的登录态过期，重新运行 `python login.py` 即可。
+`F` 表示期末，`R` 表示补考。学年优先取自网站搜索结果或详情页；网站缺少信息时才读取 PDF 首页文字或使用本地 OCR。仍无法确认学年时，目录名会包含 `idx`，避免把不确定的信息当成年份。
 
-### 批量提取
+### 3. 结束使用
 
-批量提取成功后，每套试卷目录会自动生成同名 PDF。若目录中已有页面 PNG 但缺少 PDF，再次运行时会补生成，不会重新覆盖已有 PDF。扫描件没有可提取文字时，程序会用本地 OCR 识别首页的学年和考试类型。
-
-```bash
-# 命令行传入课程代码
-python batch_capture.py EEE112
-
-# 交互询问
-python batch_capture.py
-# → 请输入课程代码: EEE112
-
-# 可选参数
-python batch_capture.py EEE112 --scale 1.5   # 低分辨率提速
+```powershell
+.\.venv\Scripts\python.exe login.py --status
+.\.venv\Scripts\python.exe login.py --close
 ```
 
-未运行 login.py 时，batch_capture.py 会退回到旧模式：自行启动浏览器并等待手动登录，抓取结束后关闭。
+`--status` 只检查常驻浏览器是否还在运行，不验证学校登录是否仍有效。`--close` 会关闭专用 Chrome；下次抓取通常需要重新手动登录。
 
-### 单篇提取
+## 常用操作
 
-```bash
-python capture_canvas.py        # 默认 2x 缩放，交互询问课程代码
-python capture_canvas.py 1.5    # 1.5x 缩放
-```
+| 需求 | 命令 |
+| --- | --- |
+| 不记得课程代码，运行时输入 | `.\.venv\Scripts\python.exe batch_capture.py` |
+| 用较低分辨率加快抓取 | `.\.venv\Scripts\python.exe batch_capture.py CAN209 --scale 1.5` |
+| 只抓搜索结果中的第一套（仅保存 PNG） | `.\.venv\Scripts\python.exe capture_canvas.py 2 CAN209` |
+| 为现有分页图片手动合并 PDF | `.\.venv\Scripts\python.exe merge_png_to_pdf.py exam_pages\CAN209_2024-25_F` |
 
-### 合并 PNG 为 PDF
+批量模式会自动合并 PDF，不需要再运行合并命令。若同名目录已有文件，批量模式会跳过重新抓取，并在缺少 PDF 时尝试补生成。它**不会检查已有 PNG 是否缺页**；若怀疑旧目录不完整，请先核对图片数量和 PDF 页数，再决定是否重新抓取。已存在的文件不会被自动改名。
 
-```bash
-python merge_png_to_pdf.py                      # 自动选最新目录
-python merge_png_to_pdf.py exam_pages/EEE112_2022-23_F
-```
+不先运行 `login.py` 也可以直接启动批量模式，此时程序会自行打开浏览器等待手动登录，并在本次运行结束后关闭浏览器。推荐使用两步法，便于连续抓取多门课程。`--headless` 不适合首次登录。
 
-## 工作流程
+## 常见问题
 
-```
-┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
-│ login.py │ → │ 导航搜索  │ → │ 收集链接  │ → │ 逐篇提取  │
-│ 手动登录  │   │ 课程代码  │   │ 处理分页  │   │ 新标签页  │
-│ Chrome常驻│   │ Search   │   │ href去重  │   │ Canvas   │
-└──────────┘   └──────────┘   └──────────┘   └──────────┘
-                                                  ↓
-                                             元数据解析
-                                             (textLayer)
-                                                  ↓
-                                             PNG → PDF
-                                                  ↓
-                                         exam_pages/{CODE}_{YEAR}_{TYPE}/
-```
+**学校网站在开启代理后空白或无法登录**
 
-### 标签页管理策略
+程序启动的 Chrome 已设置为不使用系统代理，但虚拟网卡（TUN）仍可能接管流量和 DNS。在 FlClash 中可以先保持“系统代理”和“规则”模式开启，仅关闭“虚拟网卡 / TUN”，再重新打开登录窗口。处于校内网络时，可用 `Resolve-DnsName etd.xjtlu.edu.cn` 检查是否得到校内地址；不要把一次查到的 IP 永久写死到配置中。若关闭 TUN 后仍有学校子域名走代理，检查系统代理的绕过列表是否包含 `*.xjtlu.edu.cn`。网络或代理设置由用户自行调整，脚本不会修改它们。
 
-每次提取在独立新标签页中进行，搜索结果页全程不受干扰：
+**搜索结果为 0**
 
-1. `context.new_page()` → 打开试卷详情页
-2. 点击 "View Online" → PDF viewer 在新标签页打开
-3. Canvas 提取完成 → 关闭两个标签页
-4. 回到搜索结果页，继续下一篇
+搜索框按 **Paper Code** 查找，不是按课程英文标题查找。先核对课程代码，并留意网站当前可搜索的学年范围；旧代码或较早学年的试卷可能不在本次结果中。不要把 0 篇直接当作登录失败。
 
-### 元数据解析降级链
+**目录名出现 `idx`**
 
-```
-主路径: 网站搜索结果行及详情页 → 提取 CODE/YEAR/TYPE
-  ↓ 字段缺失
-降级1: PDF 首页文字 / OCR 补全缺失字段
-  ↓ 学年仍无法确认
-降级2: 课程代码 + 索引编号（idx）
-```
+网站和 PDF 首页都未提供可确认的学年。该标记表示信息待核对，不代表抓取失败。可打开 PDF 与网站详情页比对；程序不会自动更改已有目录名。
 
-## 产出示例
+**已有 PNG，但没有 PDF**
 
-提取 4 门课程、28 套试卷：
+对该目录运行上面的 `merge_png_to_pdf.py` 命令，或重新运行同一课程的批量命令。若合并失败，原始 PNG 会保留。
 
-| 课程 | 学年 | 类型 | 页数 |
-|------|------|------|------|
-| EEE112 | 2022-25 | 三年全 | 49 |
-| CAN102 | 2022-25 | 三年全 | 71 |
-| EEE109 | 2022-25 | 三年全 | 42 |
-| MTH102 | 2022-25 | 三年全 | 54 |
+**登录会话失效**
 
-每套试卷含原始 PNG 分页 + 合并 PDF。
+保持专用 Chrome 打开；如果网站要求重新登录，请在窗口中手动完成。关闭专用 Chrome 后可重新运行 `login.py`。不要将浏览器资料目录复制或提交到 Git。
 
-## 关键代码
+## 工作原理与文件
 
-### Canvas 提取核心（capture_canvas.py）
+`login.py` 启动常驻 Chrome；`browser_session.py` 管理浏览器连接。`batch_capture.py` 复用登录会话，按课程代码搜索并逐篇打开详情页。`capture_canvas.py` 从 PDF.js 已渲染的 Canvas 保存页面图片，`merge_png_to_pdf.py` 将图片按页码合并。网站元数据优先用于命名，PDF 首页文字和 OCR 只用于补缺。
 
-```python
-def extract_canvas_pages(page, output_dir, scale=2.0):
-    for i in range(1, total + 1):
-        result = page.evaluate("""async ({pageNum, scale}) => {
-            app.pdfViewer.currentScale = scale;
-            app.page = pageNum;                          // 触发渲染
-            // ... 轮询等待 canvas 就绪 ...
-            return canvas.toDataURL('image/png', 1.0);  // 提取
-        }""", {"pageNum": i, "scale": scale})
-        # Python 端 base64 解码 → 写 PNG
-```
-
-### 搜索结果批量收集（batch_capture.py）
-
-```python
-# 保持搜索结果页不动，每个论文在新标签页中提取
-for paper in all_papers:
-    detail_page = context.new_page()       # 新标签页
-    detail_page.goto(paper.href)           # 打开详情
-    detail_page.click("text=View Online")  # 打开 PDF
-    pdf_viewer = context.pages[-1]         # 切换到 PDF 标签页
-    page_count = extract_canvas_pages(pdf_viewer, output_dir, scale)
-    pdf_viewer.close()                     # 清理
-    detail_page.close()
-```
+`exam_pages/`、`.env`、`.browser_session.json`、浏览器资料目录、虚拟环境和整理出的 `unused_files/` 均不应上传到 GitHub。`capture.py` 是旧版参考实现，不是推荐入口。
 
 ## 许可证
 
-本工具为网络攻防课程实训作品，仅供教育目的。请遵守目标系统的使用条款。
+代码采用 [MIT License](LICENSE)。此许可证不授予对学校试卷内容的再分发权。
